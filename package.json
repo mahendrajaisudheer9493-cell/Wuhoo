@@ -1,0 +1,16 @@
+{
+  "name": "wuhoo",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "dev:mcp": "pnpm --filter mcp dev",
+    "build:web": "pnpm --filter web build",
+    "build:mcp": "pnpm --filter mcp build",
+    "dev": "pnpm --parallel --filter web --filter mcp dev"
+  },
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=9"
+  }
+}
