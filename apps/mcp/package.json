@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx --env-file=.env --watch src/index.ts",
     "build": "tsc",
-    "start": "node --env-file=.env dist/index.js"
+    "start": "node --env-file=.env dist/index.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "@wuhoo/core": "workspace:*",
@@ -17,6 +18,7 @@
   "devDependencies": {
     "@types/node": "^20",
     "tsx": "^4.19.0",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^2.0.0"
   }
 }
