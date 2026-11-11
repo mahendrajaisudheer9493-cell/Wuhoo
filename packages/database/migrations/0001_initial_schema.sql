@@ -39,6 +39,13 @@
 --        fix-L  RLS DELETE policy blocks direct client deletion of owner
 --               rows; removal must go through remove_organisation_member()
 --        fix-M  EXECUTE grants added for the two new functions
+--   v9 — bootstrap owner fix:
+--        fix-N  enforce_role_assignment_rules allowed the first owner INSERT
+--               to be rejected because actor_role is NULL when the org has
+--               no members yet. Fixed: the owner-role check is skipped when
+--               organisation_members has no rows at all for this org, which
+--               is the only valid bootstrap state. Once any member exists the
+--               full owner-check applies with no loophole.
 --        F1  owner-role assignment restricted by assigner role
 --        F2  ownership invariant enforced; transfer_organisation_ownership()
 --        F3  cross-organisation FK validation triggers
@@ -228,6 +235,22 @@ CREATE OR REPLACE TRIGGER organisation_members_enforce_owner_on_delete
 -- SECURITY DEFINER functions. Direct client UPDATE of owner rows is blocked
 -- by RLS (fix-K). This trigger fires as a backstop for service-role paths
 -- and enforces the actor-role rules for non-owner membership changes.
+--
+-- Bootstrap case (fix-N):
+-- When add_org_creator_as_owner() inserts the first owner row, the actor has
+-- no existing membership row, so actor_role is NULL. Without special handling
+-- the owner-role check would reject this INSERT.
+-- Fix: the owner-role check is skipped when there are no existing members at
+-- all for this org. That is the only valid bootstrap state. Once any member
+-- row exists the full check applies unconditionally.
+-- This does not create a loophole:
+--   - Client INSERT paths are gated by RLS INSERT policies which require the
+--     caller to already be a member (is_org_owner / is_org_owner_or_admin),
+--     so a client can never reach this trigger for an org they are not in.
+--   - The bootstrap INSERT is made by add_org_creator_as_owner(), a SECURITY
+--     DEFINER function that bypasses RLS and runs only on org creation.
+--   - Service-role paths that re-bootstrap an ownerless org are legitimate
+--     administrative operations and are intentionally permitted.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION enforce_role_assignment_rules()
@@ -244,10 +267,18 @@ BEGIN
   WHERE organisation_id = NEW.organisation_id
     AND user_id = auth.uid();
 
-  -- Fail closed: if actor_role is NULL the caller is not a member of this org.
-  -- IS DISTINCT FROM 'owner' returns TRUE for both NULL and non-owner values.
+  -- Owner-role assignment check.
+  -- Skipped when there are no existing members for this org: that is the
+  -- bootstrap state where add_org_creator_as_owner() is inserting the first
+  -- owner. Once any member exists, the actor must already be an owner.
   IF NEW.role = 'owner' AND actor_role IS DISTINCT FROM 'owner' THEN
-    RAISE EXCEPTION 'Only an owner can assign the owner role.';
+    IF EXISTS (
+      SELECT 1
+      FROM public.organisation_members
+      WHERE organisation_id = NEW.organisation_id
+    ) THEN
+      RAISE EXCEPTION 'Only an owner can assign the owner role.';
+    END IF;
   END IF;
 
   IF TG_OP = 'UPDATE' THEN
