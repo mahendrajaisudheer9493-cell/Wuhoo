@@ -375,8 +375,27 @@ const server = http.createServer(
       return;
     }
 
-    // MCP endpoint — all methods (POST, GET, DELETE) routed here
+    // MCP endpoint — all methods (POST, GET, DELETE, OPTIONS) routed here
     if (req.url === "/mcp") {
+      // CORS headers required on every /mcp response so that browser-based
+      // MCP clients (including Claude's remote custom connector) can reach
+      // the endpoint. Claude sends an OPTIONS preflight before every POST;
+      // without these headers the browser blocks the request before it
+      // reaches the auth check.
+      res.setHeader("Access-Control-Allow-Origin", "https://claude.ai");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Session-Id");
+      res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+      res.setHeader("Vary", "Origin");
+
+      // Handle OPTIONS preflight before auth — the preflight carries no
+      // credentials and must succeed for the browser to send the real request.
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
       // Authenticate every request via Bearer token
       const identity = await validateBearerToken(
         req.headers["authorization"] as string | undefined
