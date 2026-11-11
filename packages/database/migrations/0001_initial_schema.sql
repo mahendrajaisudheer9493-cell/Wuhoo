@@ -7,6 +7,11 @@
 --   v2 — security review pass 1 (6 fixes)
 --   v3 — security review pass 2 (10 fixes)
 --   v4 — security review pass 3 (9 fixes):
+--   v5 — two targeted fixes:
+--        fix-A  enforce_role_assignment_rules uses IS DISTINCT FROM 'owner'
+--               so NULL actor_role (non-member) fails closed
+--        fix-B  admins UPDATE policy removes invalid OLD.role/NEW.role RLS
+--               references; role restriction delegated entirely to trigger
 --        F1  owner-role assignment restricted by assigner role
 --        F2  ownership invariant enforced; transfer_organisation_ownership()
 --        F3  cross-organisation FK validation triggers
@@ -195,14 +200,16 @@ BEGIN
   WHERE organisation_id = NEW.organisation_id
     AND user_id = auth.uid();
 
-  -- Only owners can assign the owner role.
-  IF NEW.role = 'owner' AND actor_role <> 'owner' THEN
+  -- Fail closed: if actor_role is NULL the caller is not a member of this org.
+  -- IS DISTINCT FROM 'owner' returns TRUE for both NULL and non-owner values.
+  IF NEW.role = 'owner' AND actor_role IS DISTINCT FROM 'owner' THEN
     RAISE EXCEPTION 'Only an owner can assign the owner role.';
   END IF;
 
   -- On UPDATE: admins cannot modify a row that currently belongs to an owner.
+  -- OLD is valid inside trigger functions (just not in RLS policy expressions).
   IF TG_OP = 'UPDATE' THEN
-    IF OLD.role = 'owner' AND actor_role <> 'owner' THEN
+    IF OLD.role = 'owner' AND actor_role IS DISTINCT FROM 'owner' THEN
       RAISE EXCEPTION 'Only an owner can modify another owner''s membership.';
     END IF;
   END IF;
@@ -650,8 +657,10 @@ CREATE POLICY "members can view organisation members"
   USING (organisation_id IN (SELECT my_organisation_ids()));
 
 -- F1: Owners can add members with any role.
---     Admins can add members with editor or admin role only.
---     The enforce_role_assignment_rules trigger enforces this at data level too.
+--     Admins can add members only — the enforce_role_assignment_rules trigger
+--     rejects any INSERT with role = 'owner' by a non-owner at the data layer.
+--     NEW is not available in RLS WITH CHECK for INSERT; role restriction is
+--     enforced entirely by the trigger. The policy only gates org membership.
 DROP POLICY IF EXISTS "owners can add members with any role" ON organisation_members;
 CREATE POLICY "owners can add members with any role"
   ON organisation_members FOR INSERT
@@ -660,10 +669,7 @@ CREATE POLICY "owners can add members with any role"
 DROP POLICY IF EXISTS "admins can add non-owner members" ON organisation_members;
 CREATE POLICY "admins can add non-owner members"
   ON organisation_members FOR INSERT
-  WITH CHECK (
-    is_org_owner_or_admin(organisation_id)
-    AND NEW.role IN ('editor', 'admin')
-  );
+  WITH CHECK (is_org_owner_or_admin(organisation_id));
 
 -- F1: Only owners can update any member row.
 --     Admins can update editor/admin rows but not owner rows, and not their own.
@@ -680,20 +686,21 @@ CREATE POLICY "owners can update any member role"
     AND user_id <> auth.uid()
   );
 
+-- Admins can update rows where the stored role is not 'owner', and not their own row.
+-- OLD/NEW are not available in RLS expressions — the stored role is read via subquery.
+-- The enforce_role_assignment_rules trigger prevents the new role being set to 'owner'.
 DROP POLICY IF EXISTS "admins can update non-owner members" ON organisation_members;
 CREATE POLICY "admins can update non-owner members"
   ON organisation_members FOR UPDATE
   USING (
     is_org_owner_or_admin(organisation_id)
-    AND user_id    <> auth.uid()
-    AND OLD.role   <> 'owner'
-    AND NEW.role   IN ('editor', 'admin')
+    AND user_id <> auth.uid()
+    AND role    <> 'owner'
   )
   WITH CHECK (
     is_org_owner_or_admin(organisation_id)
-    AND user_id    <> auth.uid()
-    AND OLD.role   <> 'owner'
-    AND NEW.role   IN ('editor', 'admin')
+    AND user_id <> auth.uid()
+    AND role    <> 'owner'
   );
 
 -- F1: Admins cannot delete owner rows.
