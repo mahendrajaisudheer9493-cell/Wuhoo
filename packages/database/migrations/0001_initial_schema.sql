@@ -12,6 +12,12 @@
 --               so NULL actor_role (non-member) fails closed
 --        fix-B  admins UPDATE policy removes invalid OLD.role/NEW.role RLS
 --               references; role restriction delegated entirely to trigger
+--   v6 — owner demotion guard + transfer NULL-role fix:
+--        fix-C  enforce_role_assignment_rules now blocks last-owner demotion;
+--               if OLD.role='owner' and NEW.role<>'owner', at least one other
+--               owner must exist or the UPDATE is rejected
+--        fix-D  transfer_organisation_ownership uses IS DISTINCT FROM 'owner'
+--               so a non-member caller (NULL role) cannot bypass the check
 --        F1  owner-role assignment restricted by assigner role
 --        F2  ownership invariant enforced; transfer_organisation_ownership()
 --        F3  cross-organisation FK validation triggers
@@ -212,6 +218,23 @@ BEGIN
     IF OLD.role = 'owner' AND actor_role IS DISTINCT FROM 'owner' THEN
       RAISE EXCEPTION 'Only an owner can modify another owner''s membership.';
     END IF;
+
+    -- fix-C: block last-owner demotion.
+    -- If this row is being demoted from owner, ensure at least one other owner
+    -- remains. This fires even when the actor IS the owner demoting themselves.
+    IF OLD.role = 'owner' AND NEW.role <> 'owner' THEN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM public.organisation_members
+        WHERE organisation_id = NEW.organisation_id
+          AND role = 'owner'
+          AND id <> OLD.id
+      ) THEN
+        RAISE EXCEPTION
+          'Cannot demote the last owner of organisation %. Transfer ownership first.',
+          NEW.organisation_id;
+      END IF;
+    END IF;
   END IF;
 
   RETURN NEW;
@@ -249,7 +272,8 @@ BEGIN
   WHERE organisation_id = p_organisation_id
     AND user_id = auth.uid();
 
-  IF caller_role <> 'owner' THEN
+  -- fix-D: use IS DISTINCT FROM so a NULL caller_role (non-member) fails closed.
+  IF caller_role IS DISTINCT FROM 'owner' THEN
     RAISE EXCEPTION 'Only an owner can transfer ownership.';
   END IF;
 
