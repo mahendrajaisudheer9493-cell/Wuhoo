@@ -18,6 +18,16 @@
 --               owner must exist or the UPDATE is rejected
 --        fix-D  transfer_organisation_ownership uses IS DISTINCT FROM 'owner'
 --               so a non-member caller (NULL role) cannot bypass the check
+--   v7 — concurrency-safe ownership protection:
+--        fix-E  enforce_owner_on_member_delete acquires SELECT FOR UPDATE on
+--               the organisations row before counting remaining owners, so
+--               concurrent last-owner deletions serialise correctly
+--        fix-F  enforce_role_assignment_rules acquires the same lock before
+--               the last-owner demotion count check on UPDATE
+--        fix-G  transfer_organisation_ownership acquires the lock before all
+--               role reads and writes, making the transfer fully atomic
+--        fix-H  EXECUTE on all trigger-only functions revoked from PUBLIC;
+--               RLS helper functions granted to authenticated + anon
 --        F1  owner-role assignment restricted by assigner role
 --        F2  ownership invariant enforced; transfer_organisation_ownership()
 --        F3  cross-organisation FK validation triggers
@@ -149,6 +159,10 @@ CREATE OR REPLACE TRIGGER organisations_add_creator_as_owner
 -- F2: enforce_owner_on_member_delete
 -- Prevents the last owner from leaving an organisation.
 -- Fires BEFORE DELETE on organisation_members.
+--
+-- Concurrency: acquires SELECT FOR UPDATE on the organisations row before
+-- counting remaining owners. All ownership-changing paths lock the same row,
+-- so concurrent deletions/demotions/transfers for the same org serialise.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION enforce_owner_on_member_delete()
@@ -161,6 +175,14 @@ DECLARE
   remaining_owners INTEGER;
 BEGIN
   IF OLD.role = 'owner' THEN
+    -- Acquire org-level lock before counting. Any concurrent transaction that
+    -- also tries to remove/demote an owner in this org will block here until
+    -- this transaction commits or rolls back.
+    PERFORM id
+    FROM public.organisations
+    WHERE id = OLD.organisation_id
+    FOR UPDATE;
+
     SELECT COUNT(*) INTO remaining_owners
     FROM public.organisation_members
     WHERE organisation_id = OLD.organisation_id
@@ -190,6 +212,10 @@ CREATE OR REPLACE TRIGGER organisation_members_enforce_owner_on_delete
 --   - Only an owner can insert a row with role = 'owner'.
 --   - Only an owner can change another member's role to 'owner'.
 --   - Admins cannot modify rows where the target user is an owner.
+--
+-- Concurrency: on UPDATE, acquires SELECT FOR UPDATE on the organisations row
+-- before the last-owner demotion count, serialising with the delete and
+-- transfer functions.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION enforce_role_assignment_rules()
@@ -219,10 +245,15 @@ BEGIN
       RAISE EXCEPTION 'Only an owner can modify another owner''s membership.';
     END IF;
 
-    -- fix-C: block last-owner demotion.
-    -- If this row is being demoted from owner, ensure at least one other owner
-    -- remains. This fires even when the actor IS the owner demoting themselves.
+    -- fix-C + fix-F: block last-owner demotion, with org-level lock.
+    -- Acquire the lock before counting so concurrent demotions/deletions
+    -- for the same org serialise against each other.
     IF OLD.role = 'owner' AND NEW.role <> 'owner' THEN
+      PERFORM id
+      FROM public.organisations
+      WHERE id = NEW.organisation_id
+      FOR UPDATE;
+
       IF NOT EXISTS (
         SELECT 1
         FROM public.organisation_members
@@ -251,6 +282,10 @@ CREATE OR REPLACE TRIGGER organisation_members_enforce_role_assignment
 -- Atomically transfers ownership from the calling user to new_user_id.
 -- The new owner must already be a member of the organisation.
 -- Only an existing owner can call this.
+--
+-- Concurrency: acquires SELECT FOR UPDATE on the organisations row as the
+-- very first action, before any role reads or writes. This serialises all
+-- concurrent ownership-changing operations for the same org.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION transfer_organisation_ownership(
@@ -266,7 +301,15 @@ DECLARE
   caller_role    TEXT;
   new_owner_role TEXT;
 BEGIN
-  -- Verify caller is an owner.
+  -- fix-G: acquire org-level lock first, before any membership reads or writes.
+  -- Any concurrent call to this function, or to the delete/demotion triggers
+  -- for the same org, will block here until this transaction completes.
+  PERFORM id
+  FROM public.organisations
+  WHERE id = p_organisation_id
+  FOR UPDATE;
+
+  -- Verify caller is an owner (read after lock so the role is current).
   SELECT role INTO caller_role
   FROM public.organisation_members
   WHERE organisation_id = p_organisation_id
@@ -287,13 +330,18 @@ BEGIN
     RAISE EXCEPTION 'The new owner must already be a member of the organisation.';
   END IF;
 
-  -- Promote new owner.
+  -- Promote new owner first, then demote caller.
+  -- Both UPDATEs fire enforce_role_assignment_rules. The promote UPDATE sets
+  -- NEW.role = 'owner' — the trigger allows this because the caller is still
+  -- an owner at this point. The demote UPDATE sets OLD.role = 'owner' and
+  -- NEW.role = 'admin' — the demotion guard counts remaining owners excluding
+  -- this row; the newly promoted owner is already committed in this same
+  -- transaction so the count is 1, and the demotion is allowed.
   UPDATE public.organisation_members
   SET role = 'owner'
   WHERE organisation_id = p_organisation_id
     AND user_id = p_new_owner_id;
 
-  -- Demote current owner to admin.
   UPDATE public.organisation_members
   SET role = 'admin'
   WHERE organisation_id = p_organisation_id
@@ -304,6 +352,37 @@ $$;
 -- Revoke public execute; only authenticated users should call this.
 REVOKE EXECUTE ON FUNCTION transfer_organisation_ownership(UUID, UUID) FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION transfer_organisation_ownership(UUID, UUID) TO authenticated;
+
+
+-- ---------------------------------------------------------------------------
+-- fix-H: EXECUTE permissions for trigger-only and RLS helper functions.
+--
+-- Trigger-only functions are invoked exclusively by trigger infrastructure.
+-- They must not be callable directly by any database role.
+--
+-- RLS helper functions are called from policy expressions which run under
+-- the invoking user's role. They must be executable by authenticated users.
+-- Public SELECT policies run as the anon role, so anon also needs EXECUTE
+-- on my_organisation_ids, is_org_owner_or_admin, and is_org_owner.
+-- ---------------------------------------------------------------------------
+
+-- Trigger-only: revoke direct execution from all non-superuser roles.
+REVOKE EXECUTE ON FUNCTION set_updated_at()                    FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION prevent_column_update()             FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION add_org_creator_as_owner()          FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION enforce_owner_on_member_delete()    FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION enforce_role_assignment_rules()     FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION validate_document_category_org()    FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION validate_step_media_org()           FROM PUBLIC;
+
+-- RLS helpers: must be callable by authenticated users and the anon role.
+REVOKE EXECUTE ON FUNCTION my_organisation_ids()               FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION is_org_owner_or_admin(UUID)         FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION is_org_owner(UUID)                  FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION my_organisation_ids()                TO authenticated, anon;
+GRANT EXECUTE ON FUNCTION is_org_owner_or_admin(UUID)          TO authenticated, anon;
+GRANT EXECUTE ON FUNCTION is_org_owner(UUID)                   TO authenticated, anon;
 
 
 -- ---------------------------------------------------------------------------
