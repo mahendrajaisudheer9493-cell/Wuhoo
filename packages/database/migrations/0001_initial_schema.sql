@@ -18,16 +18,27 @@
 --               owner must exist or the UPDATE is rejected
 --        fix-D  transfer_organisation_ownership uses IS DISTINCT FROM 'owner'
 --               so a non-member caller (NULL role) cannot bypass the check
---   v7 — concurrency-safe ownership protection:
---        fix-E  enforce_owner_on_member_delete acquires SELECT FOR UPDATE on
---               the organisations row before counting remaining owners, so
---               concurrent last-owner deletions serialise correctly
---        fix-F  enforce_role_assignment_rules acquires the same lock before
---               the last-owner demotion count check on UPDATE
---        fix-G  transfer_organisation_ownership acquires the lock before all
---               role reads and writes, making the transfer fully atomic
+--   v7 — concurrency-safe ownership protection (superseded by v8):
+--        fix-E/F/G attempted SELECT FOR UPDATE inside triggers — incorrect
+--               because the executor locks the membership row before the
+--               trigger fires, creating a deadlock with transfer_organisation_
+--               ownership() which locks organisations first then members.
 --        fix-H  EXECUTE on all trigger-only functions revoked from PUBLIC;
 --               RLS helper functions granted to authenticated + anon
+--   v8 — deadlock-free ownership serialisation:
+--        fix-I  removed FOR UPDATE from both trigger functions; triggers are
+--               correctness guards only, not serialisation points
+--        fix-J  all ownership-changing client paths go through SECURITY
+--               DEFINER functions that acquire the organisations lock first:
+--               transfer_organisation_ownership() (existing, updated)
+--               remove_organisation_member()      (new)
+--               demote_organisation_member()      (new)
+--        fix-K  RLS UPDATE policy on organisation_members blocks direct
+--               client role changes on owner rows; owners can only be
+--               changed through the controlled functions above
+--        fix-L  RLS DELETE policy blocks direct client deletion of owner
+--               rows; removal must go through remove_organisation_member()
+--        fix-M  EXECUTE grants added for the two new functions
 --        F1  owner-role assignment restricted by assigner role
 --        F2  ownership invariant enforced; transfer_organisation_ownership()
 --        F3  cross-organisation FK validation triggers
@@ -157,12 +168,20 @@ CREATE OR REPLACE TRIGGER organisations_add_creator_as_owner
 
 -- ---------------------------------------------------------------------------
 -- F2: enforce_owner_on_member_delete
--- Prevents the last owner from leaving an organisation.
--- Fires BEFORE DELETE on organisation_members.
+-- Last-owner deletion guard. Defence-in-depth backstop only.
 --
--- Concurrency: acquires SELECT FOR UPDATE on the organisations row before
--- counting remaining owners. All ownership-changing paths lock the same row,
--- so concurrent deletions/demotions/transfers for the same org serialise.
+-- This trigger does NOT acquire a lock on organisations. Doing so would
+-- create a deadlock: the executor locks the membership row before the trigger
+-- fires; if the trigger then tried to lock organisations, and a concurrent
+-- transfer_organisation_ownership() already held the organisations lock and
+-- was waiting for the same membership row, both transactions would wait
+-- forever.
+--
+-- Serialisation is handled exclusively by the SECURITY DEFINER functions
+-- (transfer_organisation_ownership, remove_organisation_member,
+-- demote_organisation_member) which acquire the organisations lock before
+-- touching any membership rows. Direct client DELETE on owner rows is blocked
+-- by RLS; this trigger fires only as a backstop for service-role paths.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION enforce_owner_on_member_delete()
@@ -175,14 +194,6 @@ DECLARE
   remaining_owners INTEGER;
 BEGIN
   IF OLD.role = 'owner' THEN
-    -- Acquire org-level lock before counting. Any concurrent transaction that
-    -- also tries to remove/demote an owner in this org will block here until
-    -- this transaction commits or rolls back.
-    PERFORM id
-    FROM public.organisations
-    WHERE id = OLD.organisation_id
-    FOR UPDATE;
-
     SELECT COUNT(*) INTO remaining_owners
     FROM public.organisation_members
     WHERE organisation_id = OLD.organisation_id
@@ -206,16 +217,17 @@ CREATE OR REPLACE TRIGGER organisation_members_enforce_owner_on_delete
 
 -- ---------------------------------------------------------------------------
 -- F1: enforce_role_assignment_rules
--- Prevents admins from assigning or modifying owner-role rows.
--- Fires BEFORE INSERT and BEFORE UPDATE on organisation_members.
--- Rules:
---   - Only an owner can insert a row with role = 'owner'.
---   - Only an owner can change another member's role to 'owner'.
---   - Admins cannot modify rows where the target user is an owner.
+-- Role assignment correctness guard. Defence-in-depth backstop only.
 --
--- Concurrency: on UPDATE, acquires SELECT FOR UPDATE on the organisations row
--- before the last-owner demotion count, serialising with the delete and
--- transfer functions.
+-- This trigger does NOT acquire a lock on organisations for the same reason
+-- as enforce_owner_on_member_delete: the executor locks the membership row
+-- before the trigger fires, so acquiring the organisations lock here would
+-- deadlock with transfer_organisation_ownership().
+--
+-- Serialisation for owner-role changes is handled exclusively by the
+-- SECURITY DEFINER functions. Direct client UPDATE of owner rows is blocked
+-- by RLS (fix-K). This trigger fires as a backstop for service-role paths
+-- and enforces the actor-role rules for non-owner membership changes.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION enforce_role_assignment_rules()
@@ -238,22 +250,15 @@ BEGIN
     RAISE EXCEPTION 'Only an owner can assign the owner role.';
   END IF;
 
-  -- On UPDATE: admins cannot modify a row that currently belongs to an owner.
-  -- OLD is valid inside trigger functions (just not in RLS policy expressions).
   IF TG_OP = 'UPDATE' THEN
+    -- Admins cannot modify a row that currently belongs to an owner.
     IF OLD.role = 'owner' AND actor_role IS DISTINCT FROM 'owner' THEN
       RAISE EXCEPTION 'Only an owner can modify another owner''s membership.';
     END IF;
 
-    -- fix-C + fix-F: block last-owner demotion, with org-level lock.
-    -- Acquire the lock before counting so concurrent demotions/deletions
-    -- for the same org serialise against each other.
+    -- Block last-owner demotion. No lock acquired here (see header comment).
+    -- The controlled SECURITY DEFINER functions serialise this correctly.
     IF OLD.role = 'owner' AND NEW.role <> 'owner' THEN
-      PERFORM id
-      FROM public.organisations
-      WHERE id = NEW.organisation_id
-      FOR UPDATE;
-
       IF NOT EXISTS (
         SELECT 1
         FROM public.organisation_members
@@ -278,14 +283,29 @@ CREATE OR REPLACE TRIGGER organisation_members_enforce_role_assignment
 
 
 -- ---------------------------------------------------------------------------
--- F2: transfer_organisation_ownership
--- Atomically transfers ownership from the calling user to new_user_id.
--- The new owner must already be a member of the organisation.
--- Only an existing owner can call this.
+-- =============================================================================
+-- Ownership-changing SECURITY DEFINER functions  (fix-J)
 --
--- Concurrency: acquires SELECT FOR UPDATE on the organisations row as the
--- very first action, before any role reads or writes. This serialises all
--- concurrent ownership-changing operations for the same org.
+-- All three functions follow the same lock acquisition order:
+--   1. SELECT ... FOR UPDATE on organisations  (org-level serialisation lock)
+--   2. Reads from organisation_members         (role verification)
+--   3. Writes to organisation_members          (role changes)
+--
+-- Because the organisations lock is always acquired before any membership row
+-- is touched, there is no cycle between these functions and no deadlock is
+-- possible between concurrent calls to any combination of them.
+--
+-- Direct client UPDATE/DELETE on owner rows is blocked by RLS (fix-K, fix-L),
+-- so the only way to change an owner's role or remove an owner is through
+-- these functions. The trigger guards remain as a backstop for service-role
+-- paths that bypass RLS.
+-- =============================================================================
+
+
+-- ---------------------------------------------------------------------------
+-- transfer_organisation_ownership
+-- Atomically promotes p_new_owner_id to owner and demotes the caller to admin.
+-- The new owner must already be a member. Only an existing owner can call this.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION transfer_organisation_ownership(
@@ -301,26 +321,23 @@ DECLARE
   caller_role    TEXT;
   new_owner_role TEXT;
 BEGIN
-  -- fix-G: acquire org-level lock first, before any membership reads or writes.
-  -- Any concurrent call to this function, or to the delete/demotion triggers
-  -- for the same org, will block here until this transaction completes.
+  -- Step 1: acquire org-level lock before any membership read or write.
   PERFORM id
   FROM public.organisations
   WHERE id = p_organisation_id
   FOR UPDATE;
 
-  -- Verify caller is an owner (read after lock so the role is current).
+  -- Step 2: verify caller is an owner (read after lock — guaranteed current).
   SELECT role INTO caller_role
   FROM public.organisation_members
   WHERE organisation_id = p_organisation_id
     AND user_id = auth.uid();
 
-  -- fix-D: use IS DISTINCT FROM so a NULL caller_role (non-member) fails closed.
   IF caller_role IS DISTINCT FROM 'owner' THEN
     RAISE EXCEPTION 'Only an owner can transfer ownership.';
   END IF;
 
-  -- Verify new owner is already a member.
+  -- Step 3: verify new owner is already a member.
   SELECT role INTO new_owner_role
   FROM public.organisation_members
   WHERE organisation_id = p_organisation_id
@@ -330,13 +347,9 @@ BEGIN
     RAISE EXCEPTION 'The new owner must already be a member of the organisation.';
   END IF;
 
-  -- Promote new owner first, then demote caller.
-  -- Both UPDATEs fire enforce_role_assignment_rules. The promote UPDATE sets
-  -- NEW.role = 'owner' — the trigger allows this because the caller is still
-  -- an owner at this point. The demote UPDATE sets OLD.role = 'owner' and
-  -- NEW.role = 'admin' — the demotion guard counts remaining owners excluding
-  -- this row; the newly promoted owner is already committed in this same
-  -- transaction so the count is 1, and the demotion is allowed.
+  -- Step 4: promote new owner, then demote caller.
+  -- Promote first so the demotion guard in the trigger sees at least one
+  -- remaining owner when it counts (the newly promoted one).
   UPDATE public.organisation_members
   SET role = 'owner'
   WHERE organisation_id = p_organisation_id
@@ -349,9 +362,185 @@ BEGIN
 END;
 $$;
 
--- Revoke public execute; only authenticated users should call this.
 REVOKE EXECUTE ON FUNCTION transfer_organisation_ownership(UUID, UUID) FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION transfer_organisation_ownership(UUID, UUID) TO authenticated;
+
+
+-- ---------------------------------------------------------------------------
+-- remove_organisation_member
+-- Removes any member from an organisation. Owners can remove anyone.
+-- Admins can remove editors and admins but not owners.
+-- Any member can remove themselves (leave), subject to the last-owner guard.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION remove_organisation_member(
+  p_organisation_id UUID,
+  p_user_id         UUID
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  actor_role      TEXT;
+  target_role     TEXT;
+  remaining_owners INTEGER;
+BEGIN
+  -- Step 1: acquire org-level lock.
+  PERFORM id
+  FROM public.organisations
+  WHERE id = p_organisation_id
+  FOR UPDATE;
+
+  -- Step 2: read roles after lock.
+  SELECT role INTO actor_role
+  FROM public.organisation_members
+  WHERE organisation_id = p_organisation_id
+    AND user_id = auth.uid();
+
+  SELECT role INTO target_role
+  FROM public.organisation_members
+  WHERE organisation_id = p_organisation_id
+    AND user_id = p_user_id;
+
+  IF target_role IS NULL THEN
+    RAISE EXCEPTION 'User % is not a member of organisation %.', p_user_id, p_organisation_id;
+  END IF;
+
+  -- Self-removal is allowed for any role; skip actor permission check.
+  IF auth.uid() <> p_user_id THEN
+    -- Non-self removal: caller must be a member.
+    IF actor_role IS NULL THEN
+      RAISE EXCEPTION 'Only a member can remove other members.';
+    END IF;
+    -- Admins cannot remove owners.
+    IF target_role = 'owner' AND actor_role IS DISTINCT FROM 'owner' THEN
+      RAISE EXCEPTION 'Only an owner can remove another owner.';
+    END IF;
+    -- Editors cannot remove anyone.
+    IF actor_role = 'editor' THEN
+      RAISE EXCEPTION 'Editors cannot remove members.';
+    END IF;
+  END IF;
+
+  -- Step 3: last-owner guard (applies to self-removal and owner removal).
+  IF target_role = 'owner' THEN
+    SELECT COUNT(*) INTO remaining_owners
+    FROM public.organisation_members
+    WHERE organisation_id = p_organisation_id
+      AND role = 'owner'
+      AND user_id <> p_user_id;
+
+    IF remaining_owners = 0 THEN
+      RAISE EXCEPTION
+        'Cannot remove the last owner of organisation %. Transfer ownership first.',
+        p_organisation_id;
+    END IF;
+  END IF;
+
+  -- Step 4: delete the membership row.
+  DELETE FROM public.organisation_members
+  WHERE organisation_id = p_organisation_id
+    AND user_id = p_user_id;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION remove_organisation_member(UUID, UUID) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION remove_organisation_member(UUID, UUID) TO authenticated;
+
+
+-- ---------------------------------------------------------------------------
+-- demote_organisation_member
+-- Changes a member's role. Owners can change any role.
+-- Admins can change editor/admin roles but cannot touch owner rows or
+-- assign the owner role.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION demote_organisation_member(
+  p_organisation_id UUID,
+  p_user_id         UUID,
+  p_new_role        TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  actor_role       TEXT;
+  target_role      TEXT;
+  remaining_owners INTEGER;
+BEGIN
+  IF p_new_role NOT IN ('owner', 'admin', 'editor') THEN
+    RAISE EXCEPTION 'Invalid role: %. Must be owner, admin, or editor.', p_new_role;
+  END IF;
+
+  -- Step 1: acquire org-level lock.
+  PERFORM id
+  FROM public.organisations
+  WHERE id = p_organisation_id
+  FOR UPDATE;
+
+  -- Step 2: read roles after lock.
+  SELECT role INTO actor_role
+  FROM public.organisation_members
+  WHERE organisation_id = p_organisation_id
+    AND user_id = auth.uid();
+
+  IF actor_role IS NULL THEN
+    RAISE EXCEPTION 'Only a member can change roles.';
+  END IF;
+
+  SELECT role INTO target_role
+  FROM public.organisation_members
+  WHERE organisation_id = p_organisation_id
+    AND user_id = p_user_id;
+
+  IF target_role IS NULL THEN
+    RAISE EXCEPTION 'User % is not a member of organisation %.', p_user_id, p_organisation_id;
+  END IF;
+
+  -- Admins cannot touch owner rows or assign the owner role.
+  IF actor_role = 'admin' THEN
+    IF target_role = 'owner' THEN
+      RAISE EXCEPTION 'Admins cannot modify an owner''s role.';
+    END IF;
+    IF p_new_role = 'owner' THEN
+      RAISE EXCEPTION 'Only an owner can assign the owner role.';
+    END IF;
+  END IF;
+
+  -- Editors cannot change any roles.
+  IF actor_role = 'editor' THEN
+    RAISE EXCEPTION 'Editors cannot change member roles.';
+  END IF;
+
+  -- Self-demotion from owner: last-owner guard.
+  IF target_role = 'owner' AND p_new_role <> 'owner' THEN
+    SELECT COUNT(*) INTO remaining_owners
+    FROM public.organisation_members
+    WHERE organisation_id = p_organisation_id
+      AND role = 'owner'
+      AND user_id <> p_user_id;
+
+    IF remaining_owners = 0 THEN
+      RAISE EXCEPTION
+        'Cannot demote the last owner of organisation %. Transfer ownership first.',
+        p_organisation_id;
+    END IF;
+  END IF;
+
+  -- Step 3: apply the role change.
+  UPDATE public.organisation_members
+  SET role = p_new_role
+  WHERE organisation_id = p_organisation_id
+    AND user_id = p_user_id;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION demote_organisation_member(UUID, UUID, TEXT) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION demote_organisation_member(UUID, UUID, TEXT) TO authenticated;
 
 
 -- ---------------------------------------------------------------------------
@@ -383,6 +572,16 @@ REVOKE EXECUTE ON FUNCTION is_org_owner(UUID)                  FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION my_organisation_ids()                TO authenticated, anon;
 GRANT EXECUTE ON FUNCTION is_org_owner_or_admin(UUID)          TO authenticated, anon;
 GRANT EXECUTE ON FUNCTION is_org_owner(UUID)                   TO authenticated, anon;
+
+-- fix-M: controlled ownership functions — authenticated only, not PUBLIC.
+-- transfer_organisation_ownership is already granted above its definition.
+-- Repeat here for completeness and to ensure idempotency on re-run.
+REVOKE EXECUTE ON FUNCTION transfer_organisation_ownership(UUID, UUID) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION transfer_organisation_ownership(UUID, UUID) TO authenticated;
+REVOKE EXECUTE ON FUNCTION remove_organisation_member(UUID, UUID)      FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION remove_organisation_member(UUID, UUID)      TO authenticated;
+REVOKE EXECUTE ON FUNCTION demote_organisation_member(UUID, UUID, TEXT) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION demote_organisation_member(UUID, UUID, TEXT) TO authenticated;
 
 
 -- ---------------------------------------------------------------------------
@@ -774,24 +973,28 @@ CREATE POLICY "admins can add non-owner members"
   ON organisation_members FOR INSERT
   WITH CHECK (is_org_owner_or_admin(organisation_id));
 
--- F1: Only owners can update any member row.
---     Admins can update editor/admin rows but not owner rows, and not their own.
---     Self-promotion is blocked by user_id <> auth.uid().
+-- fix-K: Direct client UPDATE on owner rows is blocked entirely.
+-- Ownership changes must go through transfer_organisation_ownership() or
+-- demote_organisation_member(), which acquire the organisations lock first.
+-- These policies only permit updating non-owner rows, and only to non-owner
+-- roles. The enforce_role_assignment_rules trigger remains as a backstop.
+
+-- Owners can update non-owner member rows (not their own, not other owners).
 DROP POLICY IF EXISTS "owners can update any member role" ON organisation_members;
 CREATE POLICY "owners can update any member role"
   ON organisation_members FOR UPDATE
   USING (
     is_org_owner(organisation_id)
-    AND user_id <> auth.uid()
+    AND user_id  <> auth.uid()
+    AND role     <> 'owner'
   )
   WITH CHECK (
     is_org_owner(organisation_id)
-    AND user_id <> auth.uid()
+    AND user_id  <> auth.uid()
+    AND role     <> 'owner'
   );
 
--- Admins can update rows where the stored role is not 'owner', and not their own row.
--- OLD/NEW are not available in RLS expressions — the stored role is read via subquery.
--- The enforce_role_assignment_rules trigger prevents the new role being set to 'owner'.
+-- Admins can update editor/admin rows (not their own, not owner rows).
 DROP POLICY IF EXISTS "admins can update non-owner members" ON organisation_members;
 CREATE POLICY "admins can update non-owner members"
   ON organisation_members FOR UPDATE
@@ -806,12 +1009,20 @@ CREATE POLICY "admins can update non-owner members"
     AND role    <> 'owner'
   );
 
--- F1: Admins cannot delete owner rows.
+-- fix-L: Direct client DELETE on owner rows is blocked entirely.
+-- Owner removal must go through remove_organisation_member(), which acquires
+-- the organisations lock first and enforces the last-owner guard.
+
+-- Owners can directly delete non-owner member rows only.
 DROP POLICY IF EXISTS "owners can remove any member" ON organisation_members;
 CREATE POLICY "owners can remove any member"
   ON organisation_members FOR DELETE
-  USING (is_org_owner(organisation_id));
+  USING (
+    is_org_owner(organisation_id)
+    AND role <> 'owner'
+  );
 
+-- Admins can directly delete non-owner member rows only.
 DROP POLICY IF EXISTS "admins can remove non-owner members" ON organisation_members;
 CREATE POLICY "admins can remove non-owner members"
   ON organisation_members FOR DELETE
@@ -820,12 +1031,15 @@ CREATE POLICY "admins can remove non-owner members"
     AND role <> 'owner'
   );
 
--- F2: Any member can leave, but the enforce_owner_on_member_delete trigger
---     prevents the last owner from leaving without transferring ownership.
+-- Members can remove themselves only if they are not an owner.
+-- Owner self-removal must go through remove_organisation_member().
 DROP POLICY IF EXISTS "members can remove themselves" ON organisation_members;
 CREATE POLICY "members can remove themselves"
   ON organisation_members FOR DELETE
-  USING (user_id = auth.uid());
+  USING (
+    user_id = auth.uid()
+    AND role <> 'owner'
+  );
 
 
 -- ---------------------------------------------------------------------------
