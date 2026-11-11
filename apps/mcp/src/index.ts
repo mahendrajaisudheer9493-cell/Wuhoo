@@ -342,6 +342,51 @@ function createMcpServer(): McpServer {
 }
 
 // ---------------------------------------------------------------------------
+// CORS configuration
+//
+// Claude's remote custom connector runs in a browser context (claude.ai).
+// Every credentialed POST is preceded by an OPTIONS preflight. CORS headers
+// must appear on BOTH the preflight response AND the actual POST response.
+//
+// The MCP transport delegates to @hono/node-server which calls
+// outgoing.writeHead(status, headersFromWebResponse) — this overwrites any
+// headers previously set via res.setHeader(). To survive that overwrite we
+// intercept writeHead on the ServerResponse and merge the CORS headers in.
+// ---------------------------------------------------------------------------
+
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin":  "https://claude.ai",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, Mcp-Session-Id",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id",
+  "Vary": "Origin",
+};
+
+/**
+ * Wraps a ServerResponse so that CORS headers are merged into every
+ * writeHead call made by the Hono adapter inside the MCP transport.
+ * Hono builds a fresh header record from the Web Standard Response and
+ * calls writeHead(), discarding any prior res.setHeader() calls.
+ */
+function withCorsHeaders(res: ServerResponse): ServerResponse {
+  const original = res.writeHead.bind(res);
+  (res as unknown as { writeHead: typeof original }).writeHead = function (
+    statusCode: number,
+    headersOrMessage?: string | Record<string, string | string[] | number>,
+    headers?: Record<string, string | string[] | number>
+  ) {
+    if (typeof headersOrMessage === "object" && headersOrMessage !== null) {
+      return original(statusCode, { ...CORS_HEADERS, ...headersOrMessage });
+    } else if (typeof headersOrMessage === "string" && typeof headers === "object") {
+      return original(statusCode, headersOrMessage, { ...CORS_HEADERS, ...headers });
+    } else {
+      return original(statusCode, { ...CORS_HEADERS });
+    }
+  } as typeof original;
+  return res;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP request body reader
 // ---------------------------------------------------------------------------
 
@@ -382,16 +427,10 @@ const server = http.createServer(
       // the endpoint. Claude sends an OPTIONS preflight before every POST;
       // without these headers the browser blocks the request before it
       // reaches the auth check.
-      res.setHeader("Access-Control-Allow-Origin", "https://claude.ai");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Session-Id");
-      res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
-      res.setHeader("Vary", "Origin");
-
-      // Handle OPTIONS preflight before auth — the preflight carries no
-      // credentials and must succeed for the browser to send the real request.
+      // Handle OPTIONS preflight before auth — preflights carry no credentials
+      // and must succeed for the browser to send the real request.
       if (req.method === "OPTIONS") {
-        res.writeHead(204);
+        res.writeHead(204, CORS_HEADERS);
         res.end();
         return;
       }
@@ -402,7 +441,7 @@ const server = http.createServer(
       );
 
       if (!identity) {
-        res.writeHead(401, { "Content-Type": "application/json" });
+        res.writeHead(401, { ...CORS_HEADERS, "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Unauthorized" }));
         return;
       }
@@ -433,7 +472,8 @@ const server = http.createServer(
       try {
         await mcpServer.connect(transport);
         const body = req.method === "POST" ? await readBody(req) : undefined;
-        await transport.handleRequest(req, res, body);
+        // Wrap res so CORS headers survive the Hono writeHead() overwrite.
+        await transport.handleRequest(req, withCorsHeaders(res), body);
       } finally {
         // Close both the transport and the server instance for this request.
         // McpServer.close() also closes the underlying transport, but calling
